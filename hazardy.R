@@ -7,7 +7,6 @@ test<-read.csv("test.csv")
 library(dplyr)
 library(tidyr)
 library(neuralnet)
-kSeed <- 2
 
 ### Plan
 ### 1. Glue the train and the test for processing
@@ -17,9 +16,10 @@ kSeed <- 2
 ### 5. Normalize numbers
 ### 6. Numerize flat factors
 ### 7. Split
-### 8. Create training function and assessment function
+### 8. Create training, predicting, rounding and assessment functions
 ### 9. Train a bunch of nnets
-kTries <- 20
+kTries     <- 500
+kSeedShift <- 1
 ## 9.1 Split train to train/test subsets
 ## 9.2 Train a net on train subset
 ## 9.3 Test the net on test subset, assess result
@@ -52,16 +52,7 @@ all <- rbind(train, test)
 # Mark ages to be approximated
 all$Age.Known <- !is.na(all$Age)
 
-# Set NA ages to mean for the class and sex
-all$Age <- mapply(function(age,class,sex) {
-                        if(is.na(age)) {
-                                mean(all[all$Sex==sex &
-                                                 all$Pclass==class, ]$Age,
-                                     na.rm=TRUE)}
-                        else age},
-                  all$Age,
-                  all$Pclass,
-                  all$Sex)
+# Will set NA ages after Titles are assigned - see step 4
 
 # Also single NA for Fare - take mean for same class and port
 # all[is.na(all$Fare), ]
@@ -117,6 +108,25 @@ all1$Title[grepl(pattern = "Countess.", x = all$Name)] <- "Noble"
 # Anyone left?
 # all$Name[is.na(all1$Title)]
 
+# Set NA ages to mean for the class and sex and title
+all1$Age <- mapply(function(age,class,sex,title) {
+        if(is.na(age)) {
+                res <- mean(all1[all1$Sex == sex &
+                                 all1$Pclass == class &
+                                 all1$Title == title, ]$Age,
+                     na.rm=TRUE)
+                if (is.na(res)) { # In case there's no mean for this group
+                        res <- mean(all1[all1$Sex == sex &
+                                                 all1$Pclass == class, ]$Age,
+                                    na.rm=TRUE)}
+                return(res)
+        }
+        else age},
+        all1$Age,
+        all1$Pclass,
+        all1$Sex,
+        all1$Title)
+
 # Take name length, the nnet will drop it if irrelevant
 all1 <- mutate(all1, Name.Length=sapply(as.character(Name),nchar))
 
@@ -171,7 +181,7 @@ bins <- all2 %>% # piped functions follow
 bins.train <- bins[train$PassengerId, ] %>% dplyr::select(-PassengerId)
 bins.test <- bins[test$PassengerId, ]
 
-### 8. Create training, results chopping and assessment functions
+### 8. Create training, predicting, rounding and assessment functions
 
 if (FALSE) {  # Preparation code     
         # Prepare list for neuralnet() call
@@ -211,15 +221,21 @@ CalculateNet <- function(df, rep=1, hidden=c(1), threshold=0.1) {
                           rep=rep)
 }
 
+# If algorithm did not converge in all repetitions, return 0s
+TryPredict <- function(nnet,test) {
+        if (is.null(nnet$weights)) matrix(0,nrow=nrow(test))
+        else neuralnet::compute(nnet, test)$net.result
+}
+
 Chop <- function(res) {
         # Takes result of neuralnet's compute
         # Returns vector of 0/1 predictons
         # Uses ifelse() instead of if() b/c former is vectorized
-        ifelse(res$net.result < 0,
+        ifelse(res < 0,
                0,
-               ifelse(res$net.result > 1,
+               ifelse(res > 1,
                       1,
-                      round(res$net.result)))
+                      round(res)))
 }
 
 Qualify <- function(real, guess) {
@@ -248,32 +264,31 @@ for(i in 1:kTries){
         
         ## 9.1 Split train to train/test subsets
         nr <- nrow(bins.train)
-        set.seed(kSeed)
+        set.seed(i+kSeedShift)
         train.numbers <- sample.int(nr, round(0.9 * nr))
         trainers <- bins.train[train.numbers, ]
         testers  <- bins.train[-train.numbers, ]
         
         ## 9.2 Train a net on train subset
-        set.seed(i)
-        r <- as.integer(runif(1,2,3))
-        h <- as.integer(runif(1,3,40))
-        t <- runif(1,0.01,0.5)
+        set.seed(i+kSeedShift)
+        r <- as.integer(runif(1,2,5))
+        h <- as.integer(runif(1,1,30))
+        t <- runif(1,0.001,1)
         nnets[[i]] <- CalculateNet(trainers, rep=r, hidden=h, threshold=t)
 
         ## 9.3 Test the net on test subset, assess result
-        res <- neuralnet::compute(nnets[[i]], dplyr::select(testers,-Survived))
+        res <- TryPredict(nnets[[i]], dplyr::select(testers,-Survived))
         qualities[i] <- Qualify(Chop(res), testers$Survived)
         print(qualities[i])
 }
 
 ### 10. Select more productive nnets and do a bunch of predictions on them
-
 predictions <- matrix(NA, ncol=0, nrow=nrow(bins.test))
 all.tries <- 1:kTries
-productive.quality <- mean(qualities)##########################
-good.tries <- all.tries[qualities > productive.quality]
+productive.quality <- quantile(qualities,c(0.85))[1]##########################
+good.tries <- all.tries[qualities >= productive.quality]
 for(i in good.tries){
-        res <- neuralnet::compute(nnets[[i]],
+        res <- TryPredict(nnets[[i]],
                                   dplyr::select(bins.test,
                                                 -PassengerId,
                                                 -Survived))
@@ -284,7 +299,8 @@ for(i in good.tries){
 
 predictions.sums <- rowSums(predictions)
 cut.off <- mean(predictions.sums[predictions.sums!=0]) ###############
-upload <- sapply(predictions.sums, function(x) if (x > cut.off) 1 else 0)
+if (is.na(cut.off)) stop("Only zero results are present")
+upload <- sapply(predictions.sums, function(x) if (x >= cut.off) 1 else 0)
 
 ### Profit
 
